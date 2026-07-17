@@ -5,6 +5,7 @@ FastAPI + Bot Telegram + Scheduler (tudo em um processo)
 
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 
 import pytz
@@ -246,6 +247,33 @@ async def lifespan(app: FastAPI):
     logger.info("🔴 Backend desligado")
 
 
+# ===================== MIDDLEWARE: NORMALIZAÇÃO DE PATH =====================
+
+class NormalizePathMiddleware:
+    """Middleware ASGI puro que colapsa barras duplicadas no path da URL.
+
+    Motivo: o frontend, se configurado com VITE_API_URL terminando em "/"
+    (ex: ".../api/"), gera chamadas como "//api/auth/login" em vez de
+    "/api/auth/login". O FastAPI trata isso como uma rota diferente e
+    devolve 404, mesmo com a rota "/api/auth/login" corretamente
+    registrada em routes.py. Esta camada corrige isso no backend,
+    funcionando como segurança extra independente de qualquer bug de
+    configuração que volte a acontecer no frontend.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if "//" in path:
+                normalized = re.sub(r"/{2,}", "/", path)
+                scope["path"] = normalized
+                logger.info(f"🔧 Path normalizado: '{path}' → '{normalized}'")
+        await self.app(scope, receive, send)
+
+
 # ===================== APP =====================
 
 app = FastAPI(
@@ -272,6 +300,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Normalização de path (ver classe acima) — protege contra "//api/..."
+app.add_middleware(NormalizePathMiddleware)
 
 # Injetar dependências reais nos routes
 import routes as routes_module
