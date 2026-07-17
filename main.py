@@ -305,9 +305,22 @@ app.add_middleware(
 app.add_middleware(NormalizePathMiddleware)
 
 # Injetar dependências reais nos routes
+#
+# CORREÇÃO CRÍTICA: a abordagem anterior (routes_module.get_db = get_db)
+# NÃO funciona com FastAPI. Cada rota que usa Depends(get_db) já capturou
+# a referência da função original (o placeholder que sempre lança
+# NotImplementedError) no momento em que routes.py foi importado e os
+# decorators @router.get/post/etc rodaram. Reatribuir o atributo do
+# módulo depois disso não tem efeito nenhum sobre rotas já registradas.
+#
+# O mecanismo correto do FastAPI para isso é app.dependency_overrides,
+# que mapeia pela IDENTIDADE do callable original (_get_db_placeholder /
+# _get_bot_placeholder, importados acima antes de qualquer reatribuição)
+# para a implementação real. É resolvido a cada requisição, então sempre
+# pega o valor mais atual de SessionLocal / telegram_bot.
 import routes as routes_module
-routes_module.get_db = get_db
-routes_module.get_bot = get_bot_instance
+app.dependency_overrides[_get_db_placeholder] = get_db
+app.dependency_overrides[_get_bot_placeholder] = get_bot_instance
 
 # Registrar rotas com prefixo /api
 app.include_router(router, prefix="/api")
