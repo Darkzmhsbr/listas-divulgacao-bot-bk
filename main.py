@@ -37,6 +37,11 @@ SessionLocal = None
 telegram_bot = None
 scheduler = AsyncIOScheduler(timezone=pytz.timezone(settings.TZ))
 
+# Flag global de saúde do backend: True somente se DB e tabelas subiram OK.
+# Usada pelo endpoint /health para reportar o status real em vez de sempre "ok".
+backend_ready = False
+startup_error = None
+
 
 # ===================== DB SESSION =====================
 
@@ -173,43 +178,67 @@ def setup_scheduler():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup e shutdown do app."""
-    global engine, SessionLocal, telegram_bot
+    """Startup e shutdown do app.
+
+    IMPORTANTE: nada aqui pode deixar uma exceção "vazar" para fora do
+    bloco try, senão o FastAPI/Uvicorn derruba o processo inteiro ANTES
+    de conseguir aceitar qualquer requisição - inclusive o /health.
+    Isso fazia o Railway mostrar "Application failed to respond" mesmo
+    para rotas que não dependem do banco.
+    """
+    global engine, SessionLocal, telegram_bot, backend_ready, startup_error
 
     logger.info("🚀 Iniciando backend Listas de Divulgação v2...")
 
-    # Banco de dados
-    engine = create_async_engine(settings.DATABASE_URL_ASYNC, echo=False)
-    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        # Banco de dados
+        if not settings.DATABASE_URL_ASYNC:
+            raise RuntimeError(
+                "DATABASE_URL não configurada (variável de ambiente ausente ou vazia)."
+            )
 
-    # Criar tabelas
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("✅ Banco de dados conectado e tabelas criadas")
+        engine = create_async_engine(settings.DATABASE_URL_ASYNC, echo=False)
+        SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-    # Dados iniciais
-    await create_initial_data()
+        # Criar tabelas
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("✅ Banco de dados conectado e tabelas criadas")
 
-    # Bot Telegram
-    telegram_bot = TelegramBot(SessionLocal)
-    async with SessionLocal() as session:
-        bot_config = await session.scalar(select(BotConfig).limit(1))
-        if bot_config and bot_config.bot_token:
-            try:
-                await telegram_bot.start(bot_config.bot_token)
-            except Exception as e:
-                logger.error(f"❌ Erro ao iniciar bot: {e}")
+        # Dados iniciais
+        await create_initial_data()
 
-    # Scheduler
-    setup_scheduler()
+        # Bot Telegram
+        telegram_bot = TelegramBot(SessionLocal)
+        async with SessionLocal() as session:
+            bot_config = await session.scalar(select(BotConfig).limit(1))
+            if bot_config and bot_config.bot_token:
+                try:
+                    await telegram_bot.start(bot_config.bot_token)
+                except Exception as e:
+                    logger.error(f"❌ Erro ao iniciar bot: {e}")
 
-    logger.info("✅ Backend pronto!")
+        # Scheduler
+        setup_scheduler()
+
+        backend_ready = True
+        logger.info("✅ Backend pronto!")
+
+    except Exception as e:
+        # Não deixamos a exceção subir: o processo continua de pé,
+        # servindo /health (que reporta o erro) em vez de morrer em
+        # silêncio e virar "Application failed to respond" no Railway.
+        startup_error = str(e)
+        logger.error(f"❌ ERRO FATAL NO STARTUP: {e}", exc_info=True)
 
     yield
 
     # Shutdown
     logger.info("🔴 Desligando backend...")
-    scheduler.shutdown(wait=False)
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
     if telegram_bot:
         await telegram_bot.stop()
     if engine:
@@ -260,17 +289,33 @@ async def root():
     return {
         "status": "online",
         "service": "Listas de Divulgação v2",
+        "backend_ready": backend_ready,
+        "startup_error": startup_error,
         "bot_connected": telegram_bot.is_running if telegram_bot else False,
     }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    # Sempre responde 200 (para o Railway healthcheck não achar que o
+    # container morreu), mas agora reporta o status real do startup em
+    # vez de mentir dizendo "ok" mesmo quando o banco/bot falharam.
+    return {
+        "status": "ok" if backend_ready else "degraded",
+        "backend_ready": backend_ready,
+        "startup_error": startup_error,
+    }
 
 
 # ===================== ENTRYPOINT =====================
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+
+    # CRÍTICO: o Railway atribui a porta dinamicamente via variável de
+    # ambiente PORT. Rodar fixo em 8000 pode não bater com a porta que
+    # o domínio público está de fato roteando, resultando em
+    # "Application failed to respond" mesmo com o processo no ar.
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
