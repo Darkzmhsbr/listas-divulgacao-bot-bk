@@ -138,9 +138,22 @@ class TelegramBot:
             member = await self.bot.get_chat_member(channel_telegram_id, self.bot.id)
             if member.status in ("administrator", "creator"):
                 result["bot_is_admin"] = True
-                result["can_post"] = getattr(member, "can_post_messages", True)
-                result["can_delete"] = getattr(member, "can_delete_messages", False)
-                result["can_pin"] = getattr(member, "can_pin_messages", False)
+                # CORREÇÃO: getattr(obj, nome, default) só usa o default
+                # quando o ATRIBUTO NÃO EXISTE. Só que o Telegram retorna
+                # can_post_messages/can_delete_messages/can_pin_messages
+                # como None (não ausentes) em vários casos — sobretudo
+                # can_pin_messages em canais, já que "fixar" é mais um
+                # conceito de grupo. Isso fazia o Pydantic rejeitar a
+                # resposta com "Input should be a valid boolean" sempre
+                # que qualquer uma dessas vinha None. Aqui, se o valor
+                # real for None, caímos explicitamente no default.
+                can_post_raw = getattr(member, "can_post_messages", None)
+                can_delete_raw = getattr(member, "can_delete_messages", None)
+                can_pin_raw = getattr(member, "can_pin_messages", None)
+
+                result["can_post"] = can_post_raw if can_post_raw is not None else True
+                result["can_delete"] = can_delete_raw if can_delete_raw is not None else False
+                result["can_pin"] = can_pin_raw if can_pin_raw is not None else False
                 result["success"] = True
                 result["message"] = "Bot é admin com permissões verificadas"
             else:
