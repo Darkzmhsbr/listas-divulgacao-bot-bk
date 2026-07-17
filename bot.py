@@ -123,7 +123,17 @@ class TelegramBot:
         try:
             chat = await self.bot.get_chat(channel_telegram_id)
             result["name"] = chat.title
-            result["member_count"] = chat.members_count or 0
+
+            # CORREÇÃO: o objeto Chat retornado por get_chat() NÃO tem o
+            # atributo "members_count" no aiogram 3.x — essa contagem
+            # precisa ser buscada com uma chamada separada da API do
+            # Telegram (get_chat_member_count). O atributo antigo era de
+            # versões anteriores da lib / de outras bibliotecas Telegram.
+            try:
+                result["member_count"] = await self.bot.get_chat_member_count(channel_telegram_id)
+            except Exception as count_err:
+                logger.warning(f"Não foi possível obter member_count de {channel_telegram_id}: {count_err}")
+                result["member_count"] = 0
 
             member = await self.bot.get_chat_member(channel_telegram_id, self.bot.id)
             if member.status in ("administrator", "creator"):
@@ -427,8 +437,10 @@ class TelegramBot:
 
             for ch in channels:
                 try:
-                    chat = await self.bot.get_chat(ch.telegram_id)
-                    count = chat.members_count or 0
+                    # CORREÇÃO: mesmo bug do verify_channel — o Chat não
+                    # tem o atributo members_count, é preciso usar
+                    # get_chat_member_count() (chamada separada da API).
+                    count = await self.bot.get_chat_member_count(ch.telegram_id)
 
                     ch.member_count = count
 
@@ -476,13 +488,20 @@ class TelegramBot:
                 )
                 config = await session.scalar(select(DispatchConfig).limit(1))
 
+            # CORREÇÃO: o f-string original tinha
+            # "{config.schedule_minute:02d if config else '00'}", que não
+            # é uma expressão Python válida (format spec não aceita
+            # condicional dessa forma) e gerava ValueError sempre que
+            # /status era executado. Calculamos o minuto formatado antes,
+            # em uma variável separada, e apenas o inserimos no f-string.
+            minute_str = f"{config.schedule_minute:02d}" if config else "00"
             msg = (
                 f"📊 <b>STATUS DO SISTEMA</b>\n\n"
                 f"📡 Canais totais: {total}\n"
                 f"✅ Canais ativos: {active}\n"
                 f"📌 Message ID: {config.message_id if config else 'N/A'}\n"
                 f"🔄 Modo: {config.mode if config else 'N/A'}\n"
-                f"📅 Agenda: {config.schedule_days if config else 'N/A'} às {config.schedule_hour if config else 'N/A'}:{config.schedule_minute:02d if config else '00'}"
+                f"📅 Agenda: {config.schedule_days if config else 'N/A'} às {config.schedule_hour if config else 'N/A'}:{minute_str}"
             )
             await message.reply(msg)
 
