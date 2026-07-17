@@ -1,0 +1,26 @@
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+
+# Bot Telegram
+aiogram==3.2.0
+
+# Banco de Dados (async)
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+
+# Autenticação
+bcrypt==4.2.0
+PyJWT==2.9.0
+
+# Agendador
+APScheduler==3.10.4
+
+# Timezone
+pytz==2024.1
+
+# CORS e HTTP
+aiohttp==3.9.5
+
+# Variáveis de ambiente (dev local)
+python-dotenv==1.0.0
