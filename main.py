@@ -170,7 +170,7 @@ def setup_scheduler():
                 replace_existing=True,
             )
 
-    asyncio.get_event_loop().create_task(load_schedule_from_db())
+    asyncio.ensure_future(load_schedule_from_db())
     scheduler.start()
     logger.info("📅 Scheduler iniciado")
 

@@ -586,7 +586,17 @@ async def get_dashboard_summary(
     config = await db.scalar(select(DispatchConfig).limit(1))
     next_info = None
     if config and config.is_active:
-        next_info = f"{config.schedule_days} às {config.schedule_hour}:{config.schedule_minute:02d}"
+        # Traduzir dias da semana para português
+        day_map = {
+            "mon": "Seg", "tue": "Ter", "wed": "Qua",
+            "thu": "Qui", "fri": "Sex", "sat": "Sáb", "sun": "Dom",
+        }
+        days_raw = config.schedule_days or ""
+        days_pt = ", ".join(
+            day_map.get(d.strip().lower(), d.strip())
+            for d in days_raw.split(",") if d.strip()
+        )
+        next_info = f"{days_pt} às {config.schedule_hour}:{config.schedule_minute:02d}"
 
     # Bot status
     bot_config = await db.scalar(select(BotConfig).limit(1))
