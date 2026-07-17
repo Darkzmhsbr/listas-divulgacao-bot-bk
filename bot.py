@@ -478,15 +478,24 @@ class TelegramBot:
 
         @self.dp.message(Command("start"))
         async def cmd_start(message: types.Message):
-            await message.reply(
-                "🤖 <b>Bot de Listas de Divulgação v2</b>\n\n"
-                "Sistema automatizado de divulgação cruzada.\n"
-                "Gerencie tudo pelo painel web!\n\n"
-                "Comandos admin:\n"
-                "/status - Status do sistema\n"
-                "/disparo - Disparo manual\n"
-                "/limpar - Limpeza manual"
-            )
+            settings = get_settings()
+            if str(message.from_user.id) == str(settings.ADMIN_CHAT_ID):
+                await message.reply(
+                    "🤖 <b>Bot de Listas de Divulgação v2</b>\n\n"
+                    "Sistema automatizado de divulgação cruzada.\n"
+                    "Gerencie tudo pelo painel web!\n\n"
+                    "Comandos admin:\n"
+                    "/status - Status do sistema\n"
+                    "/disparo - Disparo manual\n"
+                    "/limpar - Limpeza manual"
+                )
+            else:
+                await message.reply(
+                    "🤖 <b>Bot de Listas de Divulgação</b>\n\n"
+                    "Este bot é de uso interno para gerenciamento "
+                    "de divulgação cruzada em canais do Telegram.\n\n"
+                    "Se você é administrador, entre em contato com o responsável pelo sistema."
+                )
 
         @self.dp.message(Command("status"))
         async def cmd_status(message: types.Message):
