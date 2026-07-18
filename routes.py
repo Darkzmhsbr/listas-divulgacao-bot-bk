@@ -25,6 +25,7 @@ from schemas import (
     DispatchLogResponse, DispatchLogDetailResponse, SentMessageResponse,
     ChannelMetricsResponse, MemberCountEntry, DashboardSummary,
     TriggerResponse,
+    TopGrowthEntry, TopGrowthResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -560,6 +561,132 @@ async def get_channel_metrics(
 
 
 # =====================================================
+#  TOP GROWTH — Ranking de crescimento pós-disparo
+# =====================================================
+
+async def _compute_top_growth(db: AsyncSession, limit: int = 5) -> TopGrowthResponse:
+    """
+    Calcula o ranking de canais que mais cresceram desde o último disparo.
+
+    Lógica:
+    1. Busca o último DispatchLog.
+    2. Para cada canal que recebeu a mensagem (SentMessage sem erro),
+       busca o registro de MemberCountHistory mais próximo ANTES do
+       disparo para obter members_before.
+    3. Compara com Channel.member_count atual (members_now).
+    4. Calcula o delta e retorna ordenado por crescimento.
+    5. Determina se o disparo ainda está "ao vivo" (mensagens ainda
+       não foram apagadas = limpeza não ocorreu).
+    """
+    # 1. Último disparo
+    last_dispatch = await db.scalar(
+        select(DispatchLog).order_by(DispatchLog.started_at.desc()).limit(1)
+    )
+    if not last_dispatch:
+        return TopGrowthResponse()
+
+    dispatch_time = last_dispatch.started_at
+
+    # 2. Canais que receberam a mensagem com sucesso neste disparo
+    sent_result = await db.execute(
+        select(SentMessage).where(
+            SentMessage.dispatch_log_id == last_dispatch.id,
+            SentMessage.message_id > 0,  # sem erro
+            SentMessage.error.is_(None),
+        )
+    )
+    sent_messages = sent_result.scalars().all()
+
+    if not sent_messages:
+        return TopGrowthResponse(
+            dispatch_id=last_dispatch.id,
+            dispatch_started_at=dispatch_time,
+        )
+
+    # Verificar se a limpeza já ocorreu (alguma msg foi deletada)
+    any_deleted = any(msg.deleted for msg in sent_messages)
+    is_live = not any_deleted
+
+    # 3. Para cada canal, calcular crescimento
+    growth_entries = []
+    for msg in sent_messages:
+        ch_tid = msg.channel_telegram_id
+
+        # Buscar contagem ANTES do disparo (registro mais recente anterior ao disparo)
+        before_record = await db.scalar(
+            select(MemberCountHistory.member_count)
+            .where(
+                MemberCountHistory.channel_telegram_id == ch_tid,
+                MemberCountHistory.recorded_at <= dispatch_time,
+            )
+            .order_by(MemberCountHistory.recorded_at.desc())
+            .limit(1)
+        )
+
+        # Se não há registro anterior, tenta pegar o primeiro registro
+        # depois do disparo como fallback (canal pode ter sido adicionado
+        # junto com o disparo e a primeira coleta ocorreu logo depois)
+        if before_record is None:
+            before_record = await db.scalar(
+                select(MemberCountHistory.member_count)
+                .where(
+                    MemberCountHistory.channel_telegram_id == ch_tid,
+                )
+                .order_by(MemberCountHistory.recorded_at.asc())
+                .limit(1)
+            )
+
+        if before_record is None:
+            continue  # sem dados de histórico, pular
+
+        # Contagem atual do canal
+        channel = await db.scalar(
+            select(Channel).where(Channel.telegram_id == ch_tid)
+        )
+        if not channel:
+            continue
+
+        members_now = channel.member_count
+        members_before = before_record
+        growth = members_now - members_before
+        growth_pct = (growth / members_before * 100) if members_before > 0 else 0.0
+
+        growth_entries.append(TopGrowthEntry(
+            telegram_id=ch_tid,
+            name=msg.channel_name or channel.name,
+            members_before=members_before,
+            members_now=members_now,
+            growth=growth,
+            growth_percent=round(growth_pct, 2),
+        ))
+
+    # 4. Ordenar por crescimento absoluto (desc) e limitar
+    growth_entries.sort(key=lambda x: x.growth, reverse=True)
+    growth_entries = growth_entries[:limit]
+
+    return TopGrowthResponse(
+        dispatch_id=last_dispatch.id,
+        dispatch_started_at=dispatch_time,
+        cleanup_done=any_deleted,
+        is_live=is_live,
+        channels=growth_entries,
+    )
+
+
+@router.get("/metrics/top-growth", response_model=TopGrowthResponse, tags=["Métricas"])
+async def get_top_growth(
+    limit: int = Query(5, ge=1, le=20),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_admin),
+):
+    """
+    Retorna o ranking de canais que mais cresceram desde o último disparo.
+    Aceita ?limit=5 (dashboard) ou ?limit=10 (métricas).
+    """
+    return await _compute_top_growth(db, limit=limit)
+
+
+# =====================================================
 #  DASHBOARD
 # =====================================================
 
@@ -573,9 +700,70 @@ async def get_dashboard_summary(
     active = await db.scalar(
         select(func.count(Channel.id)).where(Channel.status == "active")
     )
+    error_channels = await db.scalar(
+        select(func.count(Channel.id)).where(Channel.status == "error")
+    )
     total_members = await db.scalar(
         select(func.coalesce(func.sum(Channel.member_count), 0))
     )
+
+    # Total de disparos realizados
+    total_dispatches = await db.scalar(
+        select(func.count(DispatchLog.id))
+    )
+
+    # Taxa de sucesso dos disparos (últimos 30 dias)
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    recent_dispatches_result = await db.execute(
+        select(DispatchLog).where(DispatchLog.started_at >= thirty_days_ago)
+    )
+    recent_dispatches = recent_dispatches_result.scalars().all()
+    if recent_dispatches:
+        total_sent = sum(d.success_count + d.fail_count for d in recent_dispatches)
+        total_success = sum(d.success_count for d in recent_dispatches)
+        success_rate = round((total_success / total_sent * 100) if total_sent > 0 else 0.0, 1)
+    else:
+        success_rate = 0.0
+
+    # Crescimento da rede nos últimos 7 dias
+    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+
+    # Soma dos membros 7 dias atrás (pegar o registro mais antigo de cada canal
+    # dentro da janela de 7 dias)
+    channels_result = await db.execute(select(Channel))
+    all_channels = channels_result.scalars().all()
+    members_7d_ago = 0
+    for ch in all_channels:
+        oldest_in_window = await db.scalar(
+            select(MemberCountHistory.member_count)
+            .where(
+                MemberCountHistory.channel_telegram_id == ch.telegram_id,
+                MemberCountHistory.recorded_at >= seven_days_ago,
+            )
+            .order_by(MemberCountHistory.recorded_at.asc())
+            .limit(1)
+        )
+        if oldest_in_window is not None:
+            members_7d_ago += oldest_in_window
+        else:
+            # Se não tem registro na janela, usar o registro mais recente
+            # anterior à janela como base
+            fallback = await db.scalar(
+                select(MemberCountHistory.member_count)
+                .where(
+                    MemberCountHistory.channel_telegram_id == ch.telegram_id,
+                    MemberCountHistory.recorded_at < seven_days_ago,
+                )
+                .order_by(MemberCountHistory.recorded_at.desc())
+                .limit(1)
+            )
+            if fallback is not None:
+                members_7d_ago += fallback
+            else:
+                # Sem histórico nenhum — usa o count atual como base (crescimento = 0)
+                members_7d_ago += ch.member_count
+
+    network_growth_7d = (total_members or 0) - members_7d_ago
 
     # Último disparo
     last_dispatch = await db.scalar(
@@ -601,12 +789,20 @@ async def get_dashboard_summary(
     # Bot status
     bot_config = await db.scalar(select(BotConfig).limit(1))
 
+    # Top growth para o dashboard (top 5)
+    top_growth = await _compute_top_growth(db, limit=5)
+
     return DashboardSummary(
         total_channels=total or 0,
         active_channels=active or 0,
+        error_channels=error_channels or 0,
         total_members=total_members or 0,
+        total_dispatches=total_dispatches or 0,
+        success_rate=success_rate,
+        network_growth_7d=network_growth_7d,
         last_dispatch=DispatchLogResponse.model_validate(last_dispatch) if last_dispatch else None,
         next_dispatch_info=next_info,
         bot_connected=bot.is_running,
         bot_username=bot_config.bot_username if bot_config else None,
+        top_growth=top_growth,
     )

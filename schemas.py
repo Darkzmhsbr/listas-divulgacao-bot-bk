@@ -199,14 +199,42 @@ class ChannelMetricsResponse(BaseModel):
     current_count: int
     history: List[MemberCountEntry] = []
 
+
+# ===================== TOP GROWTH (NOVO) =====================
+
+class TopGrowthEntry(BaseModel):
+    """Um canal/grupo no ranking de crescimento pós-disparo."""
+    telegram_id: int
+    name: str
+    members_before: int
+    members_now: int
+    growth: int
+    growth_percent: float
+
+class TopGrowthResponse(BaseModel):
+    """Resposta completa do ranking de crescimento do último disparo."""
+    dispatch_id: Optional[int] = None
+    dispatch_started_at: Optional[datetime] = None
+    cleanup_done: bool = False
+    is_live: bool = False
+    channels: List[TopGrowthEntry] = []
+
+
+# ===================== DASHBOARD =====================
+
 class DashboardSummary(BaseModel):
     total_channels: int
     active_channels: int
+    error_channels: int = 0
     total_members: int
+    total_dispatches: int = 0
+    success_rate: float = 0.0
+    network_growth_7d: int = 0
     last_dispatch: Optional[DispatchLogResponse] = None
     next_dispatch_info: Optional[str] = None
     bot_connected: bool
     bot_username: Optional[str] = None
+    top_growth: Optional[TopGrowthResponse] = None
 
 
 # ===================== TRIGGER RESPONSE =====================
