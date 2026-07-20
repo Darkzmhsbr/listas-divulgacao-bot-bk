@@ -96,6 +96,14 @@ def setup_scheduler():
     async def scheduled_dispatch():
         """Job de disparo automático."""
         if telegram_bot and telegram_bot.is_running:
+            # Verificar se os disparos estão ativos antes de executar.
+            # Isso permite pausar disparos pelo painel sem precisar
+            # remover os jobs do scheduler.
+            async with SessionLocal() as session:
+                config = await session.scalar(select(DispatchConfig).limit(1))
+                if not config or not config.is_active:
+                    logger.info("⏸️ Disparo automático ignorado: is_active está desativado no painel")
+                    return
             await telegram_bot.dispatch("auto")
 
     async def scheduled_cleanup():
