@@ -12,12 +12,13 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import (
     Channel, SourceChannel, DispatchConfig, DispatchLog,
-    SentMessage, MemberCountHistory, BotConfig,
+    SentMessage, MemberCountHistory, BotConfig, BotCommand,
 )
 from config import get_settings
 
@@ -32,6 +33,10 @@ class TelegramBot:
         self.bot: Optional[Bot] = None
         self.dp: Optional[Dispatcher] = None
         self._polling_task: Optional[asyncio.Task] = None
+        # Quando True, _setup_handlers NÃO agenda _setup_dynamic_commands
+        # como task — usado pelo reload_commands, que já chama o setup
+        # dinâmico de forma awaited pra evitar registro duplicado.
+        self._skip_dynamic_scheduling: bool = False
 
     # ===================== LIFECYCLE =====================
 
@@ -545,6 +550,133 @@ class TelegramBot:
             await message.reply(
                 f"✅ Apagadas: {result['deleted']} | ❌ Falhas: {result['failed']}"
             )
+
+        # ===================== COMANDOS DINÂMICOS =====================
+        #
+        # Registra os comandos configuráveis pelo painel. Roda dentro do
+        # setup inicial e pode ser reexecutado por reload_commands().
+        # Handlers criados aqui são independentes dos admins acima e
+        # respondem a qualquer usuário (não só ao ADMIN_CHAT_ID).
+        #
+        # Se _skip_dynamic_scheduling estiver True (caso do reload), NÃO
+        # agenda a task — quem chamou vai executar o setup dinâmico de
+        # forma awaited pra evitar registrar handlers em dobro.
+        if not self._skip_dynamic_scheduling:
+            try:
+                # asyncio.create_task pra não travar o setup síncrono do dp;
+                # o polling só começa depois desse método retornar, então ok.
+                asyncio.create_task(self._setup_dynamic_commands())
+            except Exception as e:
+                logger.error(f"Falha agendando setup dos comandos dinâmicos: {e}")
+
+    async def _setup_dynamic_commands(self):
+        """Carrega todos os comandos ativos do banco e registra handlers.
+
+        Cada comando vira um @dp.message(Command(nome)) que envia o
+        response_text formatado em HTML, opcionalmente com botão inline
+        que abre um Mini App (WebApp) na URL configurada.
+        """
+        if not self.dp:
+            return
+
+        try:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(BotCommand)
+                    .where(BotCommand.is_active == True)  # noqa: E712
+                    .order_by(BotCommand.sort_order.asc(), BotCommand.id.asc())
+                )
+                commands = result.scalars().all()
+
+            loaded = 0
+            for cmd in commands:
+                # IMPORTANTE: closure sobre a variável cmd — usamos default
+                # arg pra "congelar" o valor no momento da criação do
+                # handler, senão todos os handlers apontariam pro último
+                # comando do loop.
+                def make_handler(bot_command: BotCommand):
+                    async def handler(message: types.Message):
+                        try:
+                            reply_markup = None
+                            if (bot_command.has_webapp_button
+                                    and bot_command.button_text
+                                    and bot_command.webapp_url):
+                                # WebApp button precisa de URL https
+                                # pública — o Telegram exige isso.
+                                reply_markup = InlineKeyboardMarkup(
+                                    inline_keyboard=[[
+                                        InlineKeyboardButton(
+                                            text=bot_command.button_text,
+                                            web_app=WebAppInfo(url=bot_command.webapp_url),
+                                        )
+                                    ]]
+                                )
+                            await message.reply(
+                                bot_command.response_text,
+                                reply_markup=reply_markup,
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Erro respondendo /{bot_command.command}: {e}"
+                            )
+                    return handler
+
+                self.dp.message.register(
+                    make_handler(cmd),
+                    Command(cmd.command),
+                )
+                loaded += 1
+
+            logger.info(f"🧩 {loaded} comando(s) dinâmico(s) registrado(s)")
+            return loaded
+        except Exception as e:
+            logger.error(f"Erro ao registrar comandos dinâmicos: {e}")
+            return 0
+
+    async def reload_commands(self) -> int:
+        """Recria o Dispatcher para refletir alterações feitas no painel.
+
+        aiogram 3 não expõe API pública para desregistrar handlers
+        individualmente. A abordagem segura é: parar o polling, criar
+        um novo Dispatcher, chamar _setup_handlers (que agora inclui a
+        chamada aos dinâmicos), e reiniciar o polling. Como o Bot em si
+        (com o token/sessão HTTP) NÃO é recriado, não há reconexão nem
+        janela de indisponibilidade para o usuário — só o roteamento
+        interno de mensagens é reconstruído.
+        """
+        if not self.bot:
+            logger.warning("reload_commands chamado sem bot ativo")
+            return 0
+
+        # Para o polling atual
+        if self._polling_task:
+            self._polling_task.cancel()
+            try:
+                await self._polling_task
+            except asyncio.CancelledError:
+                pass
+            self._polling_task = None
+
+        # Recria o dispatcher — todos os handlers antigos vão embora.
+        # Ligamos o flag pra que _setup_handlers NÃO agende a task de
+        # setup dinâmico; nós mesmos vamos chamá-la awaited logo abaixo,
+        # garantindo que os handlers estejam prontos antes do polling
+        # reiniciar (senão o polling pega mensagens sem comandos).
+        self.dp = Dispatcher()
+        self._skip_dynamic_scheduling = True
+        try:
+            self._setup_handlers()
+        finally:
+            self._skip_dynamic_scheduling = False
+
+        loaded_raw = await self._setup_dynamic_commands()
+        loaded = loaded_raw if isinstance(loaded_raw, int) else 0
+
+        # Reinicia o polling
+        self._polling_task = asyncio.create_task(self._run_polling())
+        logger.info(f"🔄 Comandos recarregados: {loaded} ativo(s)")
+        return loaded
 
     # ===================== UTILITÁRIOS =====================
 

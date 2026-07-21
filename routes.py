@@ -15,6 +15,7 @@ from auth import get_current_admin, hash_password, verify_password, create_token
 from models import (
     Admin, BotConfig, SourceChannel, Channel,
     DispatchConfig, DispatchLog, SentMessage, MemberCountHistory,
+    BotCommand,
 )
 from schemas import (
     LoginRequest, TokenResponse, AdminResponse,
@@ -26,6 +27,7 @@ from schemas import (
     ChannelMetricsResponse, MemberCountEntry, DashboardSummary,
     TriggerResponse,
     TopGrowthEntry, TopGrowthResponse,
+    BotCommandCreate, BotCommandUpdate, BotCommandResponse, BotCommandReloadResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,6 +128,192 @@ async def verify_bot(
         await db.commit()
 
     return BotVerifyResponse(success=success, bot_username=username, message="Token válido" if success else "Token inválido")
+
+
+# =====================================================
+#  BOT COMMANDS (comandos dinâmicos configuráveis)
+# =====================================================
+#
+# CRUD dos comandos que o bot central responde no Telegram. O admin
+# pode editar o texto de resposta, ativar/desativar, e opcionalmente
+# adicionar um botão inline com WebApp (Mini App) que abre uma URL.
+# is_default=True marca os 3 comandos padrão (/como_funciona, /admin,
+# /instrucoes) e bloqueia o DELETE — o texto ainda pode ser editado.
+#
+# Após qualquer mudança (criar/editar/deletar/ativar/desativar) o
+# frontend deve chamar POST /bot/commands/reload para o bot registrar
+# os handlers novos sem precisar reiniciar o processo.
+
+@router.get("/bot/commands", response_model=list[BotCommandResponse], tags=["Bot Commands"])
+async def list_bot_commands(
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_admin),
+):
+    result = await db.execute(
+        select(BotCommand).order_by(BotCommand.sort_order.asc(), BotCommand.id.asc())
+    )
+    return result.scalars().all()
+
+
+@router.post("/bot/commands", response_model=BotCommandResponse, tags=["Bot Commands"])
+async def create_bot_command(
+    body: BotCommandCreate,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_admin),
+):
+    # Normaliza o nome do comando: remove barra inicial e espaços.
+    # O Telegram só aceita [a-z0-9_], então normalizamos aqui pra evitar
+    # que o handler simplesmente nunca dispare por conta de acento/espaço.
+    cmd_name = (body.command or "").strip().lstrip("/").lower()
+    if not cmd_name:
+        raise HTTPException(status_code=400, detail="Nome do comando obrigatório")
+
+    # Checa duplicidade
+    existing = await db.scalar(select(BotCommand).where(BotCommand.command == cmd_name))
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Já existe um comando com o nome '{cmd_name}'",
+        )
+
+    # Validação básica do botão WebApp
+    if body.has_webapp_button:
+        if not body.button_text or not body.webapp_url:
+            raise HTTPException(
+                status_code=400,
+                detail="Botão WebApp exige button_text e webapp_url preenchidos",
+            )
+        if not body.webapp_url.startswith("https://"):
+            raise HTTPException(
+                status_code=400,
+                detail="webapp_url precisa ser HTTPS (exigência do Telegram)",
+            )
+
+    cmd = BotCommand(
+        command=cmd_name,
+        description=body.description,
+        response_text=body.response_text,
+        has_webapp_button=body.has_webapp_button,
+        button_text=body.button_text,
+        webapp_url=body.webapp_url,
+        is_active=body.is_active,
+        is_default=False,  # novos comandos NUNCA são default
+        sort_order=body.sort_order,
+    )
+    db.add(cmd)
+    await db.commit()
+    await db.refresh(cmd)
+    return cmd
+
+
+@router.put("/bot/commands/{command_id}", response_model=BotCommandResponse, tags=["Bot Commands"])
+async def update_bot_command(
+    command_id: int,
+    body: BotCommandUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_admin),
+):
+    cmd = await db.scalar(select(BotCommand).where(BotCommand.id == command_id))
+    if not cmd:
+        raise HTTPException(status_code=404, detail="Comando não encontrado")
+
+    updates = body.model_dump(exclude_unset=True)
+
+    # Normaliza o nome caso esteja sendo alterado
+    if "command" in updates and updates["command"] is not None:
+        new_name = updates["command"].strip().lstrip("/").lower()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Nome do comando não pode ser vazio")
+        # Checa duplicidade se o nome mudou
+        if new_name != cmd.command:
+            dup = await db.scalar(
+                select(BotCommand).where(
+                    BotCommand.command == new_name,
+                    BotCommand.id != command_id,
+                )
+            )
+            if dup:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Já existe outro comando com o nome '{new_name}'",
+                )
+        updates["command"] = new_name
+
+    # Validação do botão WebApp quando ativado
+    will_have_button = updates.get("has_webapp_button", cmd.has_webapp_button)
+    if will_have_button:
+        button_text = updates.get("button_text", cmd.button_text)
+        webapp_url = updates.get("webapp_url", cmd.webapp_url)
+        if not button_text or not webapp_url:
+            raise HTTPException(
+                status_code=400,
+                detail="Botão WebApp exige button_text e webapp_url preenchidos",
+            )
+        if not webapp_url.startswith("https://"):
+            raise HTTPException(
+                status_code=400,
+                detail="webapp_url precisa ser HTTPS (exigência do Telegram)",
+            )
+
+    for field, value in updates.items():
+        setattr(cmd, field, value)
+
+    cmd.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(cmd)
+    return cmd
+
+
+@router.delete("/bot/commands/{command_id}", tags=["Bot Commands"])
+async def delete_bot_command(
+    command_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(get_current_admin),
+):
+    cmd = await db.scalar(select(BotCommand).where(BotCommand.id == command_id))
+    if not cmd:
+        raise HTTPException(status_code=404, detail="Comando não encontrado")
+    if cmd.is_default:
+        raise HTTPException(
+            status_code=400,
+            detail="Comandos padrão não podem ser removidos — desative-o em vez de deletar",
+        )
+    await db.delete(cmd)
+    await db.commit()
+    return {"success": True, "message": f"Comando /{cmd.command} removido"}
+
+
+@router.post("/bot/commands/reload", response_model=BotCommandReloadResponse, tags=["Bot Commands"])
+async def reload_bot_commands(
+    _: str = Depends(get_current_admin),
+    bot=Depends(get_bot),
+):
+    """Força o bot a recarregar os handlers dinâmicos.
+
+    Chamada pelo painel após qualquer alteração no CRUD acima para que
+    as mudanças reflitam imediatamente no Telegram sem precisar de
+    redeploy nem reiniciar o processo.
+    """
+    if not bot or not bot.is_running:
+        return BotCommandReloadResponse(
+            success=False,
+            message="Bot não está conectado",
+            total_loaded=0,
+        )
+    try:
+        total = await bot.reload_commands()
+        return BotCommandReloadResponse(
+            success=True,
+            message=f"{total} comando(s) recarregado(s) com sucesso",
+            total_loaded=total,
+        )
+    except Exception as e:
+        logger.error(f"Erro ao recarregar comandos do bot: {e}")
+        return BotCommandReloadResponse(
+            success=False,
+            message=f"Erro: {e}",
+            total_loaded=0,
+        )
 
 
 # =====================================================

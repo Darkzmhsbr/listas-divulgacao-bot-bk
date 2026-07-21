@@ -140,3 +140,39 @@ class MemberCountHistory(Base):
     channel_telegram_id = Column(BigInteger, nullable=False)
     member_count = Column(Integer, nullable=False)
     recorded_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+# ===================== COMANDOS DINÂMICOS DO BOT =====================
+#
+# Comandos configuráveis pelo painel: cada linha vira um /comando que o
+# bot central responde no Telegram. O texto de resposta é editado pelo
+# admin no painel (com formatação HTML compatível com Telegram — b, i,
+# u, s, code, pre, blockquote, spoiler, link). Opcionalmente pode ter
+# um botão inline abaixo da resposta que abre um Mini App (WebApp) em
+# uma URL configurada.
+#
+# Os 3 comandos padrão (/como_funciona, /admin, /instrucoes) são
+# semeados no create_initial_data e na rota /migrate-bot-commands.
+# is_default=True protege esses do delete acidental via painel — o
+# texto ainda pode ser editado normalmente.
+
+class BotCommand(Base):
+    __tablename__ = "bot_commands"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Sem a barra "/" — só o nome. Ex: "como_funciona", "admin".
+    command = Column(String(50), unique=True, nullable=False)
+    # Descrição curta pro admin identificar o comando no painel.
+    description = Column(String(200), nullable=True)
+    # Texto da resposta (HTML Telegram-compatible).
+    response_text = Column(Text, nullable=False)
+    # Botão inline com WebApp (Mini App do Telegram).
+    has_webapp_button = Column(Boolean, default=False)
+    button_text = Column(String(100), nullable=True)
+    webapp_url = Column(String(500), nullable=True)
+    # Controles.
+    is_active = Column(Boolean, default=True)
+    is_default = Column(Boolean, default=False)  # bloqueia delete no painel
+    sort_order = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

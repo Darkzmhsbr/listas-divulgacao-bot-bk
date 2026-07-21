@@ -243,3 +243,51 @@ class TriggerResponse(BaseModel):
     success: bool
     message: str
     dispatch_log_id: Optional[int] = None
+
+
+# ===================== BOT COMMANDS =====================
+
+class BotCommandCreate(BaseModel):
+    """Payload para criar um novo comando dinâmico do bot."""
+    command: str
+    description: Optional[str] = None
+    response_text: str
+    has_webapp_button: bool = False
+    button_text: Optional[str] = None
+    webapp_url: Optional[str] = None
+    is_active: bool = True
+    sort_order: int = 0
+
+class BotCommandUpdate(BaseModel):
+    """Payload de atualização parcial — só campos enviados são alterados."""
+    command: Optional[str] = None
+    description: Optional[str] = None
+    response_text: Optional[str] = None
+    has_webapp_button: Optional[bool] = None
+    button_text: Optional[str] = None
+    webapp_url: Optional[str] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+class BotCommandResponse(BaseModel):
+    id: int
+    command: str
+    description: Optional[str] = None
+    response_text: str
+    has_webapp_button: bool
+    button_text: Optional[str] = None
+    webapp_url: Optional[str] = None
+    is_active: bool
+    is_default: bool
+    sort_order: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class BotCommandReloadResponse(BaseModel):
+    """Resposta do endpoint que força o bot a recarregar os handlers."""
+    success: bool
+    message: str
+    total_loaded: int

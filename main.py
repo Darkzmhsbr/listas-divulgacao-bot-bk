@@ -17,7 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from config import get_settings
-from models import Base, Admin, BotConfig, DispatchConfig
+from models import Base, Admin, BotConfig, DispatchConfig, BotCommand
 from auth import hash_password
 from bot import TelegramBot
 from routes import router, get_db as _get_db_placeholder, get_bot as _get_bot_placeholder
@@ -57,6 +57,91 @@ def get_bot_instance():
     return telegram_bot
 
 
+# ===================== COMANDOS PADRÃO DO BOT =====================
+#
+# Textos originais fornecidos pelo cliente. Ficam como seeds tanto na
+# criação inicial (create_initial_data) quanto na rota de migração
+# pública (/migrate-bot-commands). is_default=True impede que sejam
+# deletados pelo painel — o texto ainda pode ser editado normalmente.
+#
+# ATENÇÃO: usar aspas triplas simples nos textos porque eles contêm
+# HTML compatível com o Telegram (b, i, code, blockquote) e ficam mais
+# fáceis de manter.
+
+DEFAULT_BOT_COMMANDS = [
+    {
+        "command": "como_funciona",
+        "description": "Explicação curta de como o projeto funciona",
+        "response_text": (
+            "🔩 <b>Como funciona</b> ❓\n\n"
+            "O processo é extremamente simples.\n\n"
+            "1. Entre em contato com a administração do projeto. @SuporteFLIXz\n"
+            "2. Adicione o Bot Oficial @AcessoXbrsbot como administrador do canal "
+            "ou grupo que participa da rede, concedendo todas as permissões necessárias.\n"
+            "3. Você poderá cadastrar até 5 canais ou grupos por participante.\n"
+            "4. Os canais e grupos devem estar abertos (públicos) para que sejam "
+            "adicionados à pasta oficial utilizada pelo sistema de divulgação cruzada."
+        ),
+        "has_webapp_button": False,
+        "sort_order": 10,
+    },
+    {
+        "command": "admin",
+        "description": "Contato do administrador do projeto",
+        "response_text": (
+            "Para participar ou tratar de outros assuntos entre em contato com o "
+            "admin do projeto @SuporteFLIXz"
+        ),
+        "has_webapp_button": False,
+        "sort_order": 20,
+    },
+    {
+        "command": "instrucoes",
+        "description": "Abre o Mini App com instruções completas do Elite PRIME",
+        "response_text": (
+            "Para saber mais sobre o nosso projeto, sobre como funciona de forma "
+            "mais completa e etc.. clique no botão abaixo!!"
+        ),
+        "has_webapp_button": True,
+        "button_text": "📖 Ver instruções completas",
+        # URL padrão apontando pro frontend em produção. O admin pode
+        # editar depois pelo painel se mudar o domínio do frontend.
+        "webapp_url": "https://zenyxvips.com/mini-app/instrucoes",
+        "sort_order": 30,
+    },
+]
+
+
+async def _seed_default_commands(session):
+    """Insere os comandos padrão se ainda não existirem.
+
+    Idempotente: se o comando já existe (pelo nome), NÃO sobrescreve — o
+    admin pode ter editado o texto pelo painel e não queremos reverter.
+    Só cria os que estão faltando. Usado tanto no startup quanto na rota
+    de migração pública.
+    """
+    created = 0
+    for cmd_data in DEFAULT_BOT_COMMANDS:
+        existing = await session.scalar(
+            select(BotCommand).where(BotCommand.command == cmd_data["command"])
+        )
+        if existing:
+            continue
+        session.add(BotCommand(
+            command=cmd_data["command"],
+            description=cmd_data.get("description"),
+            response_text=cmd_data["response_text"],
+            has_webapp_button=cmd_data.get("has_webapp_button", False),
+            button_text=cmd_data.get("button_text"),
+            webapp_url=cmd_data.get("webapp_url"),
+            is_active=True,
+            is_default=True,
+            sort_order=cmd_data.get("sort_order", 0),
+        ))
+        created += 1
+    return created
+
+
 # ===================== SETUP INICIAL =====================
 
 async def create_initial_data():
@@ -84,6 +169,11 @@ async def create_initial_data():
             if not bot_config:
                 session.add(BotConfig(bot_token=settings.BOT_TOKEN))
                 logger.info("✅ Bot config criada a partir da env BOT_TOKEN")
+
+        # Comandos padrão do bot (idempotente — só cria os que faltam)
+        created_cmds = await _seed_default_commands(session)
+        if created_cmds > 0:
+            logger.info(f"✅ {created_cmds} comando(s) padrão do bot seedado(s)")
 
         await session.commit()
 
@@ -357,6 +447,91 @@ async def health():
         "backend_ready": backend_ready,
         "startup_error": startup_error,
     }
+
+
+# ===================== MIGRAÇÕES =====================
+#
+# Padrão do projeto Zenyx VIPs: rotas públicas (sem auth) no root do
+# app, prefixadas com "/migrate-", que criam tabelas/colunas novas e
+# semeiam dados iniciais. São idempotentes — podem ser chamadas
+# quantas vezes forem necessárias após cada deploy sem risco.
+#
+# Como acessar após deploy no Railway:
+# https://listas-divulgacao-bot-bk.up.railway.app/migrate-bot-commands
+
+@app.get("/migrate-bot-commands")
+async def migrate_bot_commands():
+    """Cria a tabela bot_commands e semeia os 3 comandos padrão.
+
+    Executa `CREATE TABLE IF NOT EXISTS` via SQLAlchemy metadata (a
+    própria create_all já é idempotente) e depois chama
+    _seed_default_commands, que só insere os comandos que ainda não
+    existem — nunca sobrescreve texto que o admin tenha editado.
+    """
+    result = {
+        "success": False,
+        "table_created": False,
+        "commands_seeded": 0,
+        "existing_commands": [],
+        "error": None,
+    }
+
+    if not backend_ready or engine is None or SessionLocal is None:
+        result["error"] = (
+            "Backend não está pronto — verifique /health. "
+            "Startup pode ter falhado na conexão com o banco."
+        )
+        return result
+
+    try:
+        # 1) Garante a tabela — a metadata.create_all só cria o que falta,
+        # então é seguro rodar em produção sem afetar tabelas existentes.
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                lambda sync_conn: BotCommand.__table__.create(sync_conn, checkfirst=True)
+            )
+        result["table_created"] = True
+
+        # 2) Semeia os 3 comandos padrão (idempotente — só cria os que faltam).
+        async with SessionLocal() as session:
+            created = await _seed_default_commands(session)
+            await session.commit()
+
+            # Lista os comandos que existem agora — pro admin conferir.
+            existing_result = await session.execute(
+                select(BotCommand).order_by(BotCommand.sort_order.asc(), BotCommand.id.asc())
+            )
+            existing = existing_result.scalars().all()
+            result["existing_commands"] = [
+                {
+                    "id": c.id,
+                    "command": c.command,
+                    "is_active": c.is_active,
+                    "is_default": c.is_default,
+                    "has_webapp_button": c.has_webapp_button,
+                }
+                for c in existing
+            ]
+
+        result["commands_seeded"] = created
+
+        # 3) Se o bot está rodando, aproveita e recarrega os handlers
+        # pra que os comandos recém-criados já respondam sem redeploy.
+        if telegram_bot and telegram_bot.is_running:
+            try:
+                await telegram_bot.reload_commands()
+                result["bot_reloaded"] = True
+            except Exception as e:
+                result["bot_reloaded"] = False
+                result["bot_reload_error"] = str(e)
+
+        result["success"] = True
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ Migração /migrate-bot-commands falhou: {e}", exc_info=True)
+        result["error"] = str(e)
+        return result
 
 
 # ===================== ENTRYPOINT =====================
