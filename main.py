@@ -7,6 +7,7 @@ import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import pytz
 from fastapi import FastAPI
@@ -104,9 +105,9 @@ DEFAULT_BOT_COMMANDS = [
         ),
         "has_webapp_button": True,
         "button_text": "📖 Ver instruções completas",
-        # URL padrão apontando pro frontend em produção. O admin pode
-        # editar depois pelo painel se mudar o domínio do frontend.
-        "webapp_url": "https://zenyxvips.com/mini-app/instrucoes",
+        # URL padrão apontando pro frontend do projeto Listas em produção
+        # (Vercel). O admin pode editar pelo painel se o domínio mudar.
+        "webapp_url": "https://listas-divulgacao-bot-fd.vercel.app/mini-app/instrucoes",
         "sort_order": 30,
     },
 ]
@@ -530,6 +531,90 @@ async def migrate_bot_commands():
 
     except Exception as e:
         logger.error(f"❌ Migração /migrate-bot-commands falhou: {e}", exc_info=True)
+        result["error"] = str(e)
+        return result
+
+
+@app.get("/migrate-fix-instrucoes-url")
+async def migrate_fix_instrucoes_url():
+    """Corrige a webapp_url do comando /instrucoes se ainda estiver com
+    o valor incorreto do primeiro deploy (apontava pra zenyxvips.com).
+
+    Idempotente e SEGURA: só atualiza o registro se o valor atual for
+    exatamente a URL antiga errada. Se o admin já editou pelo painel
+    (URL customizada) ou se já está correta, NÃO mexe — preserva
+    qualquer customização feita manualmente.
+    """
+    OLD_WRONG_URL = "https://zenyxvips.com/mini-app/instrucoes"
+    NEW_CORRECT_URL = "https://listas-divulgacao-bot-fd.vercel.app/mini-app/instrucoes"
+
+    result = {
+        "success": False,
+        "action": "none",
+        "old_url": None,
+        "new_url": None,
+        "error": None,
+    }
+
+    if not backend_ready or SessionLocal is None:
+        result["error"] = (
+            "Backend não está pronto — verifique /health. "
+            "Startup pode ter falhado na conexão com o banco."
+        )
+        return result
+
+    try:
+        async with SessionLocal() as session:
+            cmd = await session.scalar(
+                select(BotCommand).where(BotCommand.command == "instrucoes")
+            )
+            if not cmd:
+                result["action"] = "skipped_not_found"
+                result["error"] = (
+                    "Comando /instrucoes não existe no banco — "
+                    "rode /migrate-bot-commands primeiro."
+                )
+                return result
+
+            result["old_url"] = cmd.webapp_url
+
+            if cmd.webapp_url == NEW_CORRECT_URL:
+                # Já está correto — nada a fazer.
+                result["action"] = "already_correct"
+                result["new_url"] = cmd.webapp_url
+                result["success"] = True
+                return result
+
+            if cmd.webapp_url != OLD_WRONG_URL:
+                # Foi customizado pelo admin — respeita e não sobrescreve.
+                result["action"] = "skipped_customized"
+                result["new_url"] = cmd.webapp_url
+                result["success"] = True
+                return result
+
+            # Atualiza só o valor antigo errado.
+            cmd.webapp_url = NEW_CORRECT_URL
+            cmd.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(cmd)
+
+            result["action"] = "updated"
+            result["new_url"] = cmd.webapp_url
+
+        # Recarrega o bot pra refletir imediatamente
+        if telegram_bot and telegram_bot.is_running:
+            try:
+                await telegram_bot.reload_commands()
+                result["bot_reloaded"] = True
+            except Exception as e:
+                result["bot_reloaded"] = False
+                result["bot_reload_error"] = str(e)
+
+        result["success"] = True
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ Migração /migrate-fix-instrucoes-url falhou: {e}", exc_info=True)
         result["error"] = str(e)
         return result
 
