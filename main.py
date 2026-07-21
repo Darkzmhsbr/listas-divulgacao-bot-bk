@@ -536,23 +536,47 @@ async def migrate_bot_commands():
 
 
 @app.get("/migrate-fix-instrucoes-url")
-async def migrate_fix_instrucoes_url():
-    """Corrige a webapp_url do comando /instrucoes se ainda estiver com
-    o valor incorreto do primeiro deploy (apontava pra zenyxvips.com).
+async def migrate_fix_instrucoes_url(force: bool = False):
+    """Corrige a webapp_url do comando /instrucoes.
 
-    Idempotente e SEGURA: só atualiza o registro se o valor atual for
-    exatamente a URL antiga errada. Se o admin já editou pelo painel
-    (URL customizada) ou se já está correta, NÃO mexe — preserva
-    qualquer customização feita manualmente.
+    Idempotente e segura por padrão: só corrige se detectar que a URL
+    atual é claramente suspeita (aponta pro backend Railway, pra uma
+    rota /migrate-, ou pro domínio antigo zenyxvips.com).
+
+    Se você quiser FORÇAR o reset ao default independentemente do valor
+    atual (por exemplo, pra desfazer uma customização), acesse a URL
+    com ?force=1:
+
+        /migrate-fix-instrucoes-url?force=1
+
+    Nota: uma URL válida customizada (ex: seu próprio domínio próprio
+    diferente do Vercel padrão) NÃO será considerada suspeita —
+    respeitamos qualquer URL que não bata com os padrões abaixo. Use
+    force=1 se quiser mesmo assim resetar.
     """
-    OLD_WRONG_URL = "https://zenyxvips.com/mini-app/instrucoes"
     NEW_CORRECT_URL = "https://listas-divulgacao-bot-fd.vercel.app/mini-app/instrucoes"
+
+    # Padrões que indicam URL claramente errada (falha humana no cadastro).
+    # Se qualquer um bater, tratamos como "precisa corrigir" mesmo sem force.
+    SUSPICIOUS_PATTERNS = [
+        "zenyxvips.com",             # domínio errado do primeiro seed
+        "-bk.up.railway.app",        # é o backend, não o frontend
+        "/migrate-",                 # é uma rota de migração
+        "listas-divulgacao-bot-bk",  # backend Railway em qualquer variação
+    ]
+
+    def is_suspicious(url: str) -> bool:
+        if not url:
+            return True
+        low = url.lower()
+        return any(p in low for p in SUSPICIOUS_PATTERNS)
 
     result = {
         "success": False,
         "action": "none",
         "old_url": None,
         "new_url": None,
+        "force": force,
         "error": None,
     }
 
@@ -578,27 +602,34 @@ async def migrate_fix_instrucoes_url():
 
             result["old_url"] = cmd.webapp_url
 
+            # Já está correto — nada a fazer.
             if cmd.webapp_url == NEW_CORRECT_URL:
-                # Já está correto — nada a fazer.
                 result["action"] = "already_correct"
                 result["new_url"] = cmd.webapp_url
                 result["success"] = True
                 return result
 
-            if cmd.webapp_url != OLD_WRONG_URL:
-                # Foi customizado pelo admin — respeita e não sobrescreve.
+            # Decide se deve atualizar
+            should_update = force or is_suspicious(cmd.webapp_url)
+
+            if not should_update:
+                # URL parece válida e customizada — não mexe sem force.
                 result["action"] = "skipped_customized"
                 result["new_url"] = cmd.webapp_url
-                result["success"] = True
+                result["error"] = (
+                    "URL atual parece customizada. Se quiser resetar "
+                    "para o default do Vercel, acesse esta rota com "
+                    "?force=1 no final."
+                )
                 return result
 
-            # Atualiza só o valor antigo errado.
+            # Atualiza
             cmd.webapp_url = NEW_CORRECT_URL
             cmd.updated_at = datetime.now(timezone.utc)
             await session.commit()
             await session.refresh(cmd)
 
-            result["action"] = "updated"
+            result["action"] = "updated_forced" if force else "updated"
             result["new_url"] = cmd.webapp_url
 
         # Recarrega o bot pra refletir imediatamente

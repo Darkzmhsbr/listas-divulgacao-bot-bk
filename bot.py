@@ -12,7 +12,12 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    WebAppInfo,
+    BotCommand as TelegramBotCommand,
+)
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -629,6 +634,37 @@ class TelegramBot:
                 loaded += 1
 
             logger.info(f"🧩 {loaded} comando(s) dinâmico(s) registrado(s)")
+
+            # ===== REGISTRAR NO MENU DO TELEGRAM =====
+            #
+            # Além de registrar os handlers internos do aiogram (que
+            # respondem quando o usuário digita o comando), precisamos
+            # avisar o Telegram quais comandos devem aparecer naquele
+            # menuzinho ao lado do campo de mensagem — via setMyCommands
+            # da Bot API. Sem isso os comandos funcionam, mas ficam
+            # invisíveis: o usuário só descobre digitando manualmente.
+            #
+            # Escopo default = todos os usuários e chats privados/grupos.
+            # Falhas aqui NÃO devem quebrar o setup — o menu é cosmético;
+            # os handlers em si já funcionam mesmo se a chamada falhar.
+            if self.bot:
+                try:
+                    tg_menu = [
+                        TelegramBotCommand(
+                            command=cmd.command,
+                            description=(cmd.description or cmd.command)[:256],
+                        )
+                        for cmd in commands
+                    ]
+                    await self.bot.set_my_commands(tg_menu)
+                    logger.info(
+                        f"📋 Menu do Telegram atualizado com {len(tg_menu)} comando(s)"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Falha ao atualizar menu do Telegram (setMyCommands): {e}"
+                    )
+
             return loaded
         except Exception as e:
             logger.error(f"Erro ao registrar comandos dinâmicos: {e}")
